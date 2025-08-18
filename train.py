@@ -15,6 +15,10 @@ from diffusion import MaskedDiffusion
 def train(resume=False):
     config = Config()
     
+    # Check Flash Attention availability
+    print(f"PyTorch version: {torch.__version__}")
+    print(f"Flash Attention available: {torch.backends.cuda.flash_sdp_enabled()}")
+    
     print("Loading data...")
     train_dataset, val_dataset, tokenizer = load_shakespeare(config.block_size)
     config.vocab_size = tokenizer.vocab_size

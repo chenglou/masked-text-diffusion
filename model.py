@@ -64,10 +64,14 @@ class MultiHeadAttention(nn.Module):
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
 
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        att = F.softmax(att, dim=-1)
-        att = self.attn_dropout(att)
-        y = att @ v
+        # Use Flash Attention (automatic in PyTorch 2.0+)
+        # This replaces manual attention computation with optimized kernel
+        dropout_p = self.dropout if self.training else 0.0
+        y = F.scaled_dot_product_attention(
+            q, k, v,
+            dropout_p=dropout_p,
+            is_causal=False  # Bidirectional attention for masked diffusion
+        )
         y = y.transpose(1, 2).contiguous().view(B, T, C)
 
         y = self.resid_dropout(self.c_proj(y))
