@@ -1,9 +1,7 @@
 import torch
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 import os
-import math
 
 # Set visible CUDA devices
 os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2'
@@ -19,27 +17,22 @@ def train():
     print("Loading data...")
     train_dataset, val_dataset, tokenizer = load_shakespeare(config.block_size)
     config.vocab_size = tokenizer.vocab_size
-    config.mask_token_id = tokenizer.vocab_size - 1  # Fix: set mask_token_id based on actual vocab size
+    config.mask_token_id = tokenizer.vocab_size - 1  # Last token is mask
     
     train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=config.batch_size, shuffle=False)
     
     print(f"Vocab size: {config.vocab_size}")
     print(f"Train samples: {len(train_dataset)}")
-    print(f"Val samples: {len(val_dataset)}")
     
     print("Initializing model...")
-    model = MaskedDiffusionTransformer(config)
-    model = model.to(config.device)
-    
+    model = MaskedDiffusionTransformer(config).cuda()
     diffusion = MaskedDiffusion(config, tokenizer)
-    
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
     
     print(f"Model parameters: {sum(p.numel() for p in model.parameters())/1e6:.2f}M")
     
-    scaler = torch.amp.GradScaler('cuda', enabled=(config.dtype == 'float16' and config.device == 'cuda'))
-    
+    scaler = torch.amp.GradScaler('cuda')
     iter_num = 0
     best_val_loss = float('inf')
     
@@ -53,12 +46,10 @@ def train():
             if iter_num >= config.max_iters:
                 break
             
-            batch = batch.to(config.device)
+            batch = batch.cuda()
+            t = torch.randint(0, config.diffusion_steps, (batch.shape[0],), device='cuda')
             
-            t = torch.randint(0, config.diffusion_steps, (batch.shape[0],), device=config.device)
-            
-            with torch.amp.autocast(device_type='cuda' if config.device == 'cuda' else 'cpu', 
-                                     enabled=(config.dtype == 'float16' and config.device == 'cuda')):
+            with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
                 loss = diffusion.compute_loss(model, batch, t)
             
             scaler.scale(loss).backward()
@@ -70,6 +61,7 @@ def train():
             
             pbar.set_postfix({'loss': f'{loss.item():.4f}'})
             
+            # Evaluate and save
             if iter_num % config.eval_interval == 0:
                 model.eval()
                 val_losses = []
@@ -78,8 +70,8 @@ def train():
                     for val_batch in val_loader:
                         if len(val_losses) >= config.eval_iters:
                             break
-                        val_batch = val_batch.to(config.device)
-                        t = torch.randint(0, config.diffusion_steps, (val_batch.shape[0],), device=config.device)
+                        val_batch = val_batch.cuda()
+                        t = torch.randint(0, config.diffusion_steps, (val_batch.shape[0],), device='cuda')
                         val_loss = diffusion.compute_loss(model, val_batch, t)
                         val_losses.append(val_loss.item())
                 
@@ -91,14 +83,15 @@ def train():
                     torch.save({
                         'model_state_dict': model.state_dict(),
                         'optimizer_state_dict': optimizer.state_dict(),
+                        'config': config,
                         'iter_num': iter_num,
                         'best_val_loss': best_val_loss,
-                        'config': config,
                     }, 'best_model.pt')
                     print(f"Saved best model with val loss {best_val_loss:.4f}")
                 
-                print("\nGenerating sample...")
-                sample = diffusion.sample(model, (1, config.block_size), config.device, temperature=0.8)
+                # Generate sample
+                print("Generating sample...")
+                sample = diffusion.sample(model, (1, config.block_size), 'cuda', temperature=0.8)
                 text = tokenizer.decode(sample[0].cpu().numpy())
                 print(f"Generated: {text[:200]}...")
                 print("-" * 50)
@@ -111,7 +104,6 @@ def train():
             break
     
     print("Training complete!")
-    
     return model, tokenizer, diffusion
 
 if __name__ == "__main__":

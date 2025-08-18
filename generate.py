@@ -1,31 +1,27 @@
 import torch
-import matplotlib.pyplot as plt
-import numpy as np
+import os
+
+os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2'
+
 from config import Config
 from model import MaskedDiffusionTransformer
 from data import load_shakespeare
 from diffusion import MaskedDiffusion
 
-def visualize_diffusion_process(model, diffusion, tokenizer, config, prompt=None):
-    """Visualize the denoising process step by step"""
-    device = config.device
+def visualize_generation(model, diffusion, tokenizer, config):
+    """Show the denoising process step by step"""
     
-    if prompt:
-        tokens = tokenizer.encode(prompt)[:config.block_size]
-        if len(tokens) < config.block_size:
-            tokens += [0] * (config.block_size - len(tokens))
-        x = torch.tensor([tokens], device=device)
-    else:
-        x = torch.full((1, config.block_size), diffusion.mask_token_id, device=device, dtype=torch.long)
+    # Start with all masks
+    x = torch.full((1, config.block_size), diffusion.mask_token_id, device='cuda', dtype=torch.long)
     
-    print("Starting generation process...")
-    print("=" * 50)
+    print("\nDenoising process:")
+    print("=" * 80)
     
-    steps_to_show = [0, 100, 250, 500, 750, 999]
-    samples = []
+    # Show specific steps to see the progression
+    steps_to_show = [0, 20, 40, 60, 80, 99] if config.diffusion_steps == 100 else [0, 200, 400, 600, 800, 999]
     
     for t in reversed(range(config.diffusion_steps)):
-        timesteps = torch.full((1,), t, device=device, dtype=torch.long)
+        timesteps = torch.full((1,), t, device='cuda', dtype=torch.long)
         
         with torch.no_grad():
             logits = model(x, timesteps)
@@ -33,6 +29,7 @@ def visualize_diffusion_process(model, diffusion, tokenizer, config, prompt=None
         mask = (x == diffusion.mask_token_id)
         
         if mask.any():
+            # Unmask tokens progressively
             num_to_unmask = max(1, int(mask.float().sum() / (t + 1)))
             
             probs = torch.softmax(logits / 0.8, dim=-1)
@@ -51,75 +48,73 @@ def visualize_diffusion_process(model, diffusion, tokenizer, config, prompt=None
             
             x = flat_x.view(1, config.block_size)
         
+        # Show progress at specific steps
         if config.diffusion_steps - t - 1 in steps_to_show:
-            text = tokenizer.decode(x[0].cpu().numpy())
-            text = text.replace(tokenizer.itos.get(diffusion.mask_token_id, ''), '[M]')
-            samples.append((config.diffusion_steps - t - 1, text))
-            print(f"Step {config.diffusion_steps - t - 1:4d}: {text[:100]}...")
+            # Create text with [M] for mask tokens
+            tokens_cpu = x[0].cpu().numpy()
+            text_parts = []
+            for token in tokens_cpu:
+                if token == diffusion.mask_token_id:
+                    text_parts.append('[M]')
+                else:
+                    text_parts.append(tokenizer.itos.get(token, '?'))
+            text = ''.join(text_parts)
+            
+            masked_count = (x == diffusion.mask_token_id).sum().item()
+            # Show a mix of beginning and random middle section to see unmasking
+            if masked_count > 100:
+                # When heavily masked, show just the beginning
+                print(f"Step {config.diffusion_steps - t - 1:3d} ({masked_count:3d} masked): {text[:100]}...")
+            else:
+                # When less masked, show more text to see the actual words
+                print(f"Step {config.diffusion_steps - t - 1:3d} ({masked_count:3d} masked): {text[:150]}")
     
     final_text = tokenizer.decode(x[0].cpu().numpy())
-    print("=" * 50)
-    print("Final generation:")
+    print("=" * 80)
+    print("\nFinal text:")
     print(final_text)
     
-    return samples, final_text
-
-def plot_noise_schedule(diffusion, config):
-    """Plot the noise schedule"""
-    steps = np.arange(config.diffusion_steps)
-    mask_probs = [diffusion.get_noise_schedule(t, config.diffusion_steps) for t in steps]
-    
-    plt.figure(figsize=(10, 6))
-    plt.plot(steps, mask_probs, linewidth=2)
-    plt.xlabel('Diffusion Step', fontsize=12)
-    plt.ylabel('Mask Probability', fontsize=12)
-    plt.title('Cosine Noise Schedule for Masked Text Diffusion', fontsize=14)
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig('noise_schedule.png', dpi=150)
-    plt.show()
-    print("Noise schedule plot saved to noise_schedule.png")
+    return final_text
 
 def main():
     config = Config()
     
-    print("Loading tokenizer...")
+    print("Loading data...")
     _, _, tokenizer = load_shakespeare(config.block_size)
     config.vocab_size = tokenizer.vocab_size
+    config.mask_token_id = tokenizer.vocab_size - 1
     
     print("Loading model...")
-    model = MaskedDiffusionTransformer(config)
+    model = MaskedDiffusionTransformer(config).cuda()
     
     checkpoint_path = 'best_model.pt'
-    if torch.path.exists(checkpoint_path):
-        print(f"Loading checkpoint from {checkpoint_path}")
-        checkpoint = torch.load(checkpoint_path, map_location=config.device)
+    if os.path.exists(checkpoint_path):
+        checkpoint = torch.load(checkpoint_path, weights_only=False)
         model.load_state_dict(checkpoint['model_state_dict'])
         print(f"Loaded model from iteration {checkpoint['iter_num']} with val loss {checkpoint['best_val_loss']:.4f}")
     else:
         print("No checkpoint found, using untrained model")
     
-    model = model.to(config.device)
     model.eval()
-    
     diffusion = MaskedDiffusion(config, tokenizer)
     
-    plot_noise_schedule(diffusion, config)
+    # Show the denoising process
+    print("\n" + "="*80)
+    print("VISUALIZING DIFFUSION PROCESS")
+    print("="*80)
+    visualize_generation(model, diffusion, tokenizer, config)
     
-    print("\n" + "=" * 50)
-    print("Generating text with diffusion process visualization...")
-    print("=" * 50 + "\n")
+    # Generate more samples with different temperatures
+    print("\n" + "="*80)
+    print("GENERATING MORE SAMPLES")
+    print("="*80)
     
-    samples, final_text = visualize_diffusion_process(model, diffusion, tokenizer, config)
-    
-    print("\n" + "=" * 50)
-    print("Generating another sample...")
-    print("=" * 50 + "\n")
-    
-    with torch.no_grad():
-        sample = diffusion.sample(model, (1, config.block_size), config.device, temperature=1.0)
-    generated_text = tokenizer.decode(sample[0].cpu().numpy())
-    print(generated_text)
+    for temp in [0.7, 0.85, 1.0]:
+        print(f"\nTemperature {temp}:")
+        with torch.no_grad():
+            sample = diffusion.sample(model, (1, config.block_size), 'cuda', temperature=temp)
+        text = tokenizer.decode(sample[0].cpu().numpy())
+        print(text)
 
 if __name__ == "__main__":
     main()

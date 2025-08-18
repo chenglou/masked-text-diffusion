@@ -74,6 +74,7 @@ class MaskedDiffusion:
             
             mask = (x == self.mask_token_id)
             
+            # Original simple schedule - guarantees completion
             num_to_unmask = max(1, int(mask.float().sum() / (t + 1)))
             
             probs = F.softmax(logits / temperature, dim=-1)
