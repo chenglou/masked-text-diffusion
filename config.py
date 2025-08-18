@@ -1,6 +1,6 @@
 class Config:
-    vocab_size = 256
-    block_size = 128
+    vocab_size = 50258  # GPT-2 BPE vocabulary + 1 for [MASK] token
+    block_size = 128    # Now in BPE tokens, not characters (~512 chars)
     n_embd = 384
     n_head = 6
     n_layer = 6

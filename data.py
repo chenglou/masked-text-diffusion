@@ -3,29 +3,26 @@ import numpy as np
 from torch.utils.data import Dataset, DataLoader
 import urllib.request
 import os
+import tiktoken
 
-class CharTokenizer:
+class BPETokenizer:
+    """GPT-2 BPE tokenizer wrapper with added [MASK] token"""
     def __init__(self):
-        self.chars = None
-        self.stoi = None
-        self.itos = None
-        self.vocab_size = None
-
-    def fit(self, text):
-        chars = sorted(list(set(text)))
-        self.vocab_size = len(chars) + 1  # +1 for mask token
-        self.stoi = {ch: i for i, ch in enumerate(chars)}
-        self.mask_token_id = len(chars)  # Last token is mask
-        self.stoi['[MASK]'] = self.mask_token_id
-        self.itos = {i: ch for ch, i in self.stoi.items()}
-        self.chars = chars
-        return self
+        self.enc = tiktoken.get_encoding("gpt2")
+        # Add one token for [MASK] beyond GPT-2's vocabulary
+        self.vocab_size = self.enc.n_vocab + 1  # 50258 (50257 + 1)
+        self.mask_token_id = 50257  # New token after GPT-2's vocab
+        self.itos = {}  # For compatibility with old code
 
     def encode(self, text):
-        return [self.stoi[c] for c in text if c in self.stoi]
+        return self.enc.encode(text, allowed_special={"<|endoftext|>"})
 
     def decode(self, tokens):
-        return ''.join([self.itos[i] for i in tokens if i in self.itos])
+        # Filter out mask tokens before decoding
+        filtered_tokens = [t for t in tokens if t != self.mask_token_id]
+        if not filtered_tokens:
+            return ""
+        return self.enc.decode(filtered_tokens)
 
 class TextDataset(Dataset):
     def __init__(self, data, block_size):
@@ -53,8 +50,15 @@ def load_shakespeare(block_size=128):
     with open(data_path, 'r') as f:
         text = f.read()
 
-    tokenizer = CharTokenizer().fit(text)
+    # Use BPE tokenizer
+    tokenizer = BPETokenizer()
     data = tokenizer.encode(text)
+
+    print(f"BPE tokenization stats:")
+    print(f"  Characters: {len(text):,}")
+    print(f"  BPE tokens: {len(data):,}")
+    print(f"  Compression: {len(text)/len(data):.2f}x")
+    print(f"  Vocab size: {tokenizer.vocab_size:,}")
 
     n = len(data)
     train_data = data[:int(n*0.9)]

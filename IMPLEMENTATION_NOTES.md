@@ -3,20 +3,29 @@
 ## Overview
 We built a minimal masked text diffusion model from scratch, inspired by nanoGPT's simplicity. This implements discrete diffusion for text generation using progressive token masking/unmasking rather than continuous noise.
 
-## Architecture Decisions
+## Current Architecture (v2.0 - BPE + Modern Improvements)
 
-### Core Model: Bidirectional Transformer
-- **6 layers, 6 heads, 384 dim** (~11M parameters)
-- **Why bidirectional**: Unlike GPT (autoregressive), masked diffusion needs to see context from both directions to predict masked tokens
-- **Timestep conditioning**: Added sinusoidal time embeddings so model knows corruption level
+### Core Model: Bidirectional Transformer with RoPE
+- **6 layers, 6 heads, 384 dim** (~49M parameters with BPE vocabulary)
+- **Rotary Position Embeddings (RoPE)**: No learned position embeddings, better extrapolation
+- **Flash Attention**: 2-4x faster training, memory efficient
+- **bfloat16**: No gradient scaler needed, cleaner code
+- **BPE Tokenization**: GPT-2's tokenizer with 50,258 tokens (including [MASK])
+
+### Tokenization Evolution
+
+| Version | Type | Vocab Size | Sequence Meaning | Model Size |
+|---------|------|------------|------------------|------------|
+| v1.0 | Character | 66 | 128 characters | 11M params |
+| v2.0 | BPE | 50,258 | 128 tokens (~512 chars) | 49M params |
 
 ### Diffusion Process
-- **Forward process**: Progressively mask tokens according to schedule (clean text → [MASK] tokens)
+- **Forward process**: Progressively mask tokens according to cosine schedule
 - **Reverse process**: Learn to predict original tokens from partially masked sequences
 - **Key insight**: Treating text corruption as discrete diffusion where tokens transition to [MASK] states
 
 ### Noise Schedule
-We implemented a **cosine schedule** for masking probability:
+Cosine schedule for masking probability:
 ```python
 def get_noise_schedule(self, t, total_steps):
     s = 0.008  # Small offset to prevent singularities
@@ -26,153 +35,136 @@ def get_noise_schedule(self, t, total_steps):
     mask_prob = 1 - (numerator / denominator)
     return np.clip(mask_prob, 0.0, 0.999)
 ```
-- Creates S-curve: slow start → fast middle → slow end
-- Clipped at 0.999 to avoid completely masked sequences
+
+## Major Architectural Improvements
+
+### 1. RoPE (Rotary Position Embeddings)
+- **What**: Encodes position through rotation of embedding vectors
+- **Why**: Better than learned embeddings - can extrapolate, no parameters, relative positions
+- **Impact**: Immediate improvement in loss convergence
+
+### 2. Flash Attention
+- **What**: Fused kernel that never materializes full attention matrix
+- **Why**: 2-4x faster, 50% memory savings
+- **Implementation**: Single line change using `F.scaled_dot_product_attention`
+
+### 3. bfloat16 Precision
+- **What**: Brain floating point - same range as float32, less precision
+- **Why**: No gradient scaler needed, prevents overflow
+- **Code simplification**: Removed 5 lines of scaler management
+
+### 4. BPE Tokenization
+- **What**: Byte-Pair Encoding using GPT-2's vocabulary
+- **Why**: Semantic understanding vs character spelling
+- **Compression**: 3.3x fewer tokens for same text
+- **Challenge**: 78% of parameters now in embeddings
 
 ## Training Insights
 
+### Character vs BPE Loss Scales
+- **Character-level**: Loss ~2.2-2.3 (choosing from 66 options)
+- **BPE-level**: Loss ~3.5-4.0 (choosing from 50k options)
+- Both represent similar perplexity when adjusted for vocabulary size
+
 ### Batch Size Discovery
-Initially tried batch_size=128, but performance suffered. Key learning:
-- **NOT about timestep diversity** (we were wrong initially!)
-- Each sample in batch gets its own random timestep `t`
-- Real issue: larger batches = smoother gradients = slower learning
-- **Optimal**: batch_size=64 balances stability and learning speed
+- Larger batches don't help masked diffusion as much as expected
+- Each sample gets random timestep - diversity matters more than batch size
+- Optimal: 64 for character, might need 32 for BPE (memory constraints)
 
-### Timesteps and Iterations
-- **Diffusion is different from autoregressive**:
-  - Autoregressive: Learn one task (predict next token)
-  - Diffusion: Learn T tasks (denoise at each timestep)
-- **Epochs don't matter**: We care about seeing diverse (batch, timestep) combinations
-- Training for 100k+ iterations ensures good coverage of all timesteps
+### Timestep Dynamics
+- Model tends to unmask high-confidence tokens too early
+- Results in "frozen" text that doesn't change much during generation
+- Solution: Could add temperature or confidence smoothing to unmasking
 
-### Loss Patterns
-- Loss varies dramatically by timestep:
-  - t≈0: Easy (few masks), loss ~0.5-2.0
-  - t≈500: Medium difficulty, loss ~2-4
-  - t≈999: Hard (mostly masked), loss ~4-6
-- Overall loss of 2.0-2.5 indicates good performance
-
-## Generation Strategy
-
-### Unmasking Schedule
-The critical generation formula:
+### The Unmasking Schedule
 ```python
 num_to_unmask = max(1, int(mask.float().sum() / (t + 1)))
 ```
+This creates acceleration towards the end - sometimes unmasking 30+ tokens in final step.
 
-This creates an interesting pattern:
-- Early steps (t=99→80): Unmask ~1 token per step
-- Middle steps (t=50→20): Unmask 1-2 tokens per step  
-- Final steps (t=10→0): Accelerate dramatically
-- **Problem**: Big jump at t=0 (unmask all remaining)
+## Current Performance (BPE Model)
 
-### The Final Jump Issue
-With 100 timesteps and 128 tokens:
-- Step 98→1: Gradual unmasking
-- Step 0: Must unmask ~30-40 tokens at once
-- This causes quality degradation ("doubg", "hhas")
+After 16k iterations:
+- **Train loss**: 4.0
+- **Val loss**: 6.1
+- **Generation**: Coherent Shakespeare dialogue with character names
+- **Issues**: Some spelling mistakes ("KING HWARDRY VI"), overfitting gap
 
-**Solutions explored**:
-1. Cap unmasking rate → Doesn't complete generation ❌
-2. More timesteps (300) → Smoother but 3x slower ✓
-3. Accept the jump → Simple and works ✓
+## Parameter Breakdown (49M Model)
 
-## Key Parameters Evolution
-
-### Initial Setup (100 timesteps)
-```python
-diffusion_steps = 100
-batch_size = 64
-learning_rate = 3e-4
-max_iters = 105000
 ```
-- Fast generation but large final jump
-- Good for experimentation
-
-### Improved Setup (300 timesteps)
-```python
-diffusion_steps = 300  # Smoother unmasking
-max_iters = 300000     # More training for better quality
+Token embeddings:    50,258 × 384 = 19.3M
+Time embeddings:     300 × 384    = 0.12M
+Attention (×6):      3.5M
+MLP (×6):           7.1M
+Output head:         50,258 × 384 = 19.3M
+-------------------------------------------
+Total:              49.3M parameters
+Embeddings:         78% of total parameters
 ```
-- 3x slower generation but much smoother
-- Better final quality
 
-## Results and Quality Progression
+## Key Design Decisions
 
-### Training Milestones
-| Iterations | Val Loss | Quality | Example |
-|------------|----------|---------|---------|
-| 50k | ~3.0 | Learning structure | Random characters with some patterns |
-| 89k | 2.31 | Good structure, poor spelling | "GLOUCISTER:", dialogue format |
-| 97k | 2.29 | Better vocabulary | "Second Keeper:", mostly real words |
-| 150k+ | <2.0 | Target: Fluent Shakespeare | Correct spelling, coherent sentences |
+### Why Bidirectional (not Autoregressive)?
+- Masked diffusion needs context from both directions
+- Can edit/refine anywhere in sequence
+- Better for iterative generation
 
-### What the Model Learned
-1. **Structure** (Excellent by 90k iters):
-   - Character names with colons
-   - Dialogue format
-   - Line breaks and scenes
+### Why 300 Diffusion Steps?
+- Balance between generation quality and speed
+- 100 steps: Too few, large jumps at end
+- 1000 steps: Overkill for text, very slow
+- 300 steps: Good compromise
 
-2. **Vocabulary** (Good by 100k iters):
-   - Shakespeare-like words: "viole", "master", "dole"
-   - Character names: "Gloucester", "Keeper"
-   - Some spelling issues persist
-
-3. **Coherence** (Needs more training):
-   - Local coherence good (phrases make sense)
-   - Long-range coherence needs improvement
-
-## Sampling vs Training Decoupling
-
-**Critical insight**: Training and sampling are independent!
-- **Training**: Learn p(x₀|xₜ, t) for all t
-- **Sampling**: Choose how to use those predictions
-
-We can experiment with different unmasking strategies without retraining:
-- Linear schedule
-- Confidence-based adaptive rates
-- Temperature scaling
-- Top-k filtering
-
-## Code Simplifications Made
-
-1. **Removed all conditionals**: Assumed CUDA, float16
-2. **Hardcoded device settings**: GPUs 0,1,2
-3. **Simplified data loading**: Just Shakespeare
-4. **Minimal dependencies**: Only PyTorch, numpy, tqdm
-
-## Comparison with Alternatives
-
-| Approach | Pros | Cons |
-|----------|------|------|
-| **Our Masked Diffusion** | Bidirectional context, parallel generation, controllable | Less explored than AR |
-| **GPT-style (Autoregressive)** | Well understood, lots of research | Sequential only, no bidirectional |
-| **Continuous Diffusion (D3PM)** | Closer to image diffusion | Complex for discrete data |
-| **BERT-style (Masked LM)** | Similar architecture | No iterative refinement |
-
-## Future Improvements
-
-1. **Importance sampling**: Weight harder timesteps during training
-2. **Learned noise schedule**: Let model learn optimal masking rates
-3. **Conditional generation**: Add prompt conditioning
-4. **Better unmasking**: Adaptive strategies based on confidence
-5. **Scale up**: Bigger model, more data (enwik8)
-
-## Key Takeaways
-
-1. **Masked diffusion works for text** - We can adapt image diffusion ideas to discrete domains
-2. **Simplicity wins** - Our minimal implementation is fully functional
-3. **Batch size matters differently** - Not about timestep diversity but gradient dynamics
-4. **Training/sampling decoupling** - Can improve generation without retraining
-5. **The final jump is inherent** - Trade-off between completion guarantee and quality
+### Why Dedicated [MASK] Token?
+- Originally used <|endoftext|> (token 50256)
+- Problem: Confuses semantic meaning
+- Solution: Added token 50257 as dedicated [MASK]
+- Vocabulary is now 50,258 tokens
 
 ## Files Overview
 
-- `config.py` - All hyperparameters in one place
-- `model.py` - Bidirectional transformer with time conditioning  
-- `diffusion.py` - Noise schedule and sampling logic
-- `data.py` - Character tokenizer and Shakespeare loader
-- `train.py` - Training loop with validation
-- `generate.py` - Visualization and generation scripts
+- `config.py` - Hyperparameters (updated for BPE)
+- `model.py` - Transformer with RoPE and Flash Attention
+- `diffusion.py` - Cosine noise schedule and sampling
+- `data.py` - BPE tokenization using tiktoken
+- `train.py` - Training loop with bfloat16
+- `generate.py` - Visualization and generation
 
-Total: ~500 lines of clean, educational code demonstrating masked text diffusion from scratch!
+## Lessons Learned
+
+1. **Position encoding matters**: RoPE immediately improved quality
+2. **Tokenization is fundamental**: BPE completely changes model dynamics
+3. **Modern optimizations compound**: Flash + bfloat16 + RoPE work together
+4. **Embedding size dominates**: With large vocabulary, embeddings become the bottleneck
+5. **Diffusion needs different thinking**: Timestep diversity > batch size
+
+## Future Improvements to Consider
+
+1. **SwiGLU activation**: Tested but minimal improvement at this scale
+2. **Adaptive unmasking**: Prevent overconfident early reveals
+3. **Importance sampling**: Weight harder timesteps during training
+4. **Longer context**: block_size=256 for more coherent generation
+5. **Scale model depth**: 8-12 layers might help with BPE tokens
+
+## Training Recommendations
+
+For BPE model:
+- Train for 100k+ iterations (vs 50k for character model)
+- Monitor validation gap - consider dropout=0.15 if overfitting
+- Try batch_size=32 if memory limited
+- Expect loss to plateau around 3.5-4.0 (this is good!)
+
+## Comparison: Character vs BPE
+
+| Metric | Character-level | BPE-level |
+|--------|----------------|-----------|
+| Model size | 11M | 49M |
+| Vocab size | 66 | 50,258 |
+| Tokens for "Hello" | 5 | 1 |
+| Training speed | Fast | Slower |
+| Generation quality | Letter-by-letter | Word-aware |
+| Loss scale | ~2.2 | ~4.0 |
+| Context window | 128 chars | ~512 chars |
+
+The shift to BPE fundamentally changed the model from a "speller" to a "word predictor", requiring 5x more parameters but delivering much better semantic understanding.
