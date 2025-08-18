@@ -2,6 +2,7 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 import os
+import sys
 
 # Set visible CUDA devices
 os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2'
@@ -11,7 +12,7 @@ from model import MaskedDiffusionTransformer
 from data import load_shakespeare
 from diffusion import MaskedDiffusion
 
-def train():
+def train(resume=False):
     config = Config()
     
     print("Loading data...")
@@ -35,6 +36,20 @@ def train():
     scaler = torch.amp.GradScaler('cuda')
     iter_num = 0
     best_val_loss = float('inf')
+    
+    # Resume from checkpoint if requested
+    if resume and os.path.exists('best_model.pt'):
+        print("Resuming from checkpoint...")
+        checkpoint = torch.load('best_model.pt', weights_only=False)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        iter_num = checkpoint['iter_num']
+        best_val_loss = checkpoint['best_val_loss']
+        print(f"Resumed from iteration {iter_num} with best val loss {best_val_loss:.4f}")
+    elif resume:
+        print("Warning: --resume flag set but no checkpoint found. Starting fresh...")
+    else:
+        print("Starting fresh training...")
     
     print("Starting training...")
     model.train()
@@ -107,4 +122,6 @@ def train():
     return model, tokenizer, diffusion
 
 if __name__ == "__main__":
-    model, tokenizer, diffusion = train()
+    # Check for --resume flag
+    resume = '--resume' in sys.argv
+    model, tokenizer, diffusion = train(resume=resume)
