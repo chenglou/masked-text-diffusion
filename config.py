@@ -16,4 +16,4 @@ class Config:
     eval_iters = 200
 
     device = 'cuda'
-    dtype = 'float16'
+    dtype = 'bfloat16'

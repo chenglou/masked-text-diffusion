@@ -33,7 +33,7 @@ def train(resume=False):
     
     print(f"Model parameters: {sum(p.numel() for p in model.parameters())/1e6:.2f}M")
     
-    scaler = torch.amp.GradScaler('cuda')
+    # No GradScaler needed with bfloat16!
     iter_num = 0
     best_val_loss = float('inf')
     
@@ -64,14 +64,13 @@ def train(resume=False):
             batch = batch.cuda()
             t = torch.randint(0, config.diffusion_steps, (batch.shape[0],), device='cuda')
             
-            with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+            with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
                 loss = diffusion.compute_loss(model, batch, t)
             
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
+            # Direct backward pass - no scaling needed with bfloat16!
+            loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            scaler.step(optimizer)
-            scaler.update()
+            optimizer.step()
             optimizer.zero_grad(set_to_none=True)
             
             pbar.set_postfix({'loss': f'{loss.item():.4f}'})
