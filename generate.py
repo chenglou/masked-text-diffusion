@@ -17,9 +17,10 @@ def visualize_generation(model, diffusion, tokenizer, config):
     print("\nDenoising process:")
     print("=" * 80)
 
-    # Show exactly 10 evenly spaced steps (every diffusion_steps/10)
-    step_interval = max(1, config.diffusion_steps // 10)
-    steps_to_show = [min(config.diffusion_steps - 1, i * step_interval) for i in range(10)]
+    # Show 10 evenly spaced steps throughout the denoising process
+    step_interval = config.diffusion_steps // 10
+    steps_to_show = [i * step_interval for i in range(10)]
+    steps_to_show.append(config.diffusion_steps - 1)  # Always show the final step
 
     for t in reversed(range(config.diffusion_steps)):
         timesteps = torch.full((1,), t, device='cuda', dtype=torch.long)

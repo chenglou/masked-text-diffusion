@@ -3,26 +3,66 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 
+def precompute_freqs_cis(dim: int, seq_len: int, theta: float = 10000.0):
+    """Precompute the frequency tensor for RoPE."""
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
+    t = torch.arange(seq_len, dtype=torch.float32)
+    freqs = torch.outer(t, freqs)
+    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
+    return freqs_cis
+
+def apply_rotary_emb(xq, xk, freqs_cis):
+    """Apply rotary embeddings to query and key tensors."""
+    # xq, xk shape: (batch, seq_len, n_heads, head_dim)
+    # freqs_cis shape: (seq_len, head_dim//2)
+    
+    # Reshape to complex numbers
+    xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
+    xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
+    
+    # Apply rotation
+    freqs_cis = freqs_cis.unsqueeze(1)  # (seq_len, 1, head_dim//2)
+    xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
+    xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
+    
+    return xq_out.type_as(xq), xk_out.type_as(xk)
+
 class MultiHeadAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
         self.n_head = config.n_head
         self.n_embd = config.n_embd
+        self.head_dim = config.n_embd // config.n_head
         self.dropout = config.dropout
 
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=False)
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
+        
+        # Precompute RoPE frequencies
+        self.register_buffer(
+            "freqs_cis",
+            precompute_freqs_cis(self.head_dim, config.block_size * 2),
+            persistent=False
+        )
 
     def forward(self, x):
         B, T, C = x.size()
 
         q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        k = k.view(B, T, self.n_head, self.head_dim)
+        q = q.view(B, T, self.n_head, self.head_dim)
+        v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        
+        # Apply RoPE to queries and keys
+        freqs_cis = self.freqs_cis[:T]
+        q, k = apply_rotary_emb(q, k, freqs_cis)
+        
+        # Convert to (B, n_head, T, head_dim) for attention
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
 
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
         att = F.softmax(att, dim=-1)
@@ -67,7 +107,7 @@ class MaskedDiffusionTransformer(nn.Module):
         self.config = config
 
         self.token_embedding = nn.Embedding(config.vocab_size, config.n_embd)
-        self.position_embedding = nn.Embedding(config.block_size, config.n_embd)
+        # No position embedding needed - RoPE handles it!
         self.time_embedding = nn.Embedding(config.diffusion_steps, config.n_embd)
         self.dropout = nn.Dropout(config.dropout)
 
@@ -94,13 +134,11 @@ class MaskedDiffusionTransformer(nn.Module):
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
 
-        pos = torch.arange(0, t, dtype=torch.long, device=device)
-
         tok_emb = self.token_embedding(idx)
-        pos_emb = self.position_embedding(pos)
         time_emb = self.time_embedding(timesteps).unsqueeze(1)
-
-        x = self.dropout(tok_emb + pos_emb + time_emb)
+        
+        # No position embedding - RoPE handles it in attention
+        x = self.dropout(tok_emb + time_emb)
 
         for block in self.blocks:
             x = block(x)
