@@ -9,7 +9,7 @@ os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2'
 
 from config import Config
 from model import MaskedDiffusionTransformer
-from data import load_shakespeare
+from data_tinystories import load_tinystories
 from diffusion import MaskedDiffusion
 
 def train(resume=False):
@@ -20,7 +20,12 @@ def train(resume=False):
     print(f"Flash Attention available: {torch.backends.cuda.flash_sdp_enabled()}")
     
     print("Loading data...")
-    train_dataset, val_dataset, tokenizer = load_shakespeare(config.block_size)
+    # Load TinyStories with 10M tokens for reasonable training time
+    # Increase max_train_tokens for better quality (e.g., 50M or None for all)
+    train_dataset, val_dataset, tokenizer = load_tinystories(
+        config.block_size, 
+        max_train_tokens=10_000_000
+    )
     config.vocab_size = tokenizer.vocab_size
     config.mask_token_id = tokenizer.vocab_size - 1  # Last token is mask
     

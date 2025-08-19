@@ -5,7 +5,7 @@ os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2'
 
 from config import Config
 from model import MaskedDiffusionTransformer
-from data import load_shakespeare
+from data_tinystories import load_tinystories
 from diffusion import MaskedDiffusion
 
 def visualize_generation(model, diffusion, tokenizer, config):
@@ -59,7 +59,9 @@ def visualize_generation(model, diffusion, tokenizer, config):
                 if token == diffusion.mask_token_id:
                     text_parts.append('[M]')
                 else:
-                    text_parts.append(tokenizer.itos.get(token, '?'))
+                    # For BPE tokenizer, decode individual tokens
+                    decoded = tokenizer.decode([token])
+                    text_parts.append(decoded)
             text = ''.join(text_parts)
 
             masked_count = (x == diffusion.mask_token_id).sum().item()
@@ -82,7 +84,8 @@ def main():
     config = Config()
 
     print("Loading data...")
-    _, _, tokenizer = load_shakespeare(config.block_size)
+    # Just load tokenizer, don't need the full dataset for generation
+    _, _, tokenizer = load_tinystories(config.block_size, max_train_tokens=1000)
     config.vocab_size = tokenizer.vocab_size
     config.mask_token_id = tokenizer.vocab_size - 1
 
